@@ -1,0 +1,53 @@
+# Configuration de CTSpy — scraper de rendez-vous de contrôle technique
+#
+# Chaque centre déclare un `scraper` (rdvonline ou securitest) et les
+# paramètres propres à sa plateforme. Les identifiants proviennent du code
+# source des pages de prise de rendez-vous (voir README.md, section
+# "Ajouter un centre").
+
+# Nombre de semaines à couvrir à partir d'aujourd'hui
+weeks_ahead: 4
+
+# Délai de politesse entre deux requêtes HTTP vers un même site (secondes)
+request_delay: 1.5
+
+# Chemin de la base SQLite (relatif au dossier du projet)
+database: ctspy.db
+
+centers:
+  - id: control-v11-villemoustaussou
+    name: "CONTROL'V"
+    city: Villemoustaussou
+    scraper: rdvonline
+    base_url: "https://www.control-v11.fr"
+    # Page publique de prise de RDV (sert de Referer et de source de cookies)
+    booking_path: "/1393-Villemoustaussou/rendez-vous"
+    id_etab: 1393
+    # Profil demandé : ids lus dans le code de la page (balises data-id)
+    vehicle:
+      id_tvehi: 11        # Véhicule particulier
+      id_energie: 5       # Essence (5=Essence, 6=Diesel, 7=GPL, 8=Hybride/Electricité)
+      id_tctrl: 99        # CTP — Contrôle technique réglementaire (100 = CC Pol)
+      id_pref_tcli: 5
+    labels:
+      vehicle: "Véhicule particulier"
+      energy: "Essence"
+      control: "CTP"
+
+  - id: securitest-carcassonne-aab
+    name: "AAB (Sécuritest)"
+    city: Carcassonne
+    scraper: securitest
+    url: "https://agenda2.securitest.org/rdv/?origine=affilie&c=S011027#!/"
+    code_centre: "S01102702"
+    # Textes cliqués dans le parcours Angular avant d'atteindre le planning.
+    # Chaque étape essaie les libellés dans l'ordre jusqu'à en trouver un.
+    steps:
+      - ["Voiture particulière", "Véhicule particulier", "Voiture"]
+      - ["Essence"]
+      - ["Contrôle technique périodique", "Visite technique périodique", "Contrôle périodique", "CTP", "VTP"]
+    next_button_texts: ["Suivant", "Continuer", "Valider", "Choisir"]
+    labels:
+      vehicle: "Véhicule particulier"
+      energy: "Essence"
+      control: "CTP"
