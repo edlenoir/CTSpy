@@ -1,24 +1,26 @@
 """Scraper des agendas Sécuritest / plateforme Genilink (agenda2.securitest.org).
 
-Contrairement à RDV-Online, ce site est une application AngularJS : le planning
-n'apparaît qu'après avoir renseigné plusieurs étapes (type de véhicule,
-énergie, type de contrôle). On pilote donc un vrai navigateur (Playwright /
-Chromium) qui :
+Ce site est une application AngularJS, mais son API JSON est appelable
+directement (vérifié en conditions réelles) — c'est le **mode API**, utilisé
+en premier :
 
-  1. ouvre la page et ferme la bannière de cookies ;
-  2. franchit les étapes en cliquant les libellés configurés dans
-     config.yaml (clé `steps`) puis les boutons « Suivant / Continuer » ;
-  3. une fois le planning affiché, récupère les créneaux de deux façons
-     complémentaires :
-       a. interception des réponses JSON de l'API Genilink pendant la
-          navigation (le plus fiable : on y cherche récursivement des objets
-          date + heure + tarif) ;
-       b. à défaut, lecture heuristique du DOM (éléments dont le texte est un
-          horaire, rattachés à la colonne/l'en-tête de jour la plus proche).
+  1. GET de la page d'accueil (`?origine=affilie&c=...`) : le serveur associe
+     le centre à la session PHP (cookie PHPSESSID) ;
+  2. GET `/rdv/api/calendar?dateFrom=..&dateTo=..&typeRdv=..&typeVeh=..
+     &carbVeh=..&codeCentre=..` : liste des jours ouverts avec tarif du jour ;
+  3. GET `/rdv/api/creneau?date=..&...` pour chaque jour ouvert : les horaires
+     avec `price` / `final_price` / `promo` (ex. remise paiement en ligne).
 
-En cas d'échec, des artefacts de debug (capture d'écran, HTML, JSON
-interceptés) sont écrits dans `debug/securitest/` pour ajuster facilement les
-sélecteurs — la structure exacte des écrans peut varier selon le centre.
+Identifiants utiles (endpoint `/rdv/api/types`) : typeVeh 1=VP, 2=VU... ;
+carbVeh 1=Essence, 2=Diesel, 3=Gaz, 4=Hybride, 5=Electrique ;
+typeRdv 1=CTP (contrôle périodique), cf. `rdv_types` de `/rdv/api/config`.
+
+En cas d'échec de l'API (évolution du site), un **mode navigateur** de repli
+pilote Chromium via Playwright : il franchit les étapes en cliquant les
+libellés configurés (`steps` dans config.yaml) puis récupère les créneaux en
+interceptant les réponses JSON, ou à défaut par lecture heuristique du DOM.
+Les échecs du mode navigateur produisent des artefacts de debug (capture
+d'écran, HTML, JSON interceptés) dans `debug/securitest/`.
 """
 
 from __future__ import annotations
@@ -27,10 +29,18 @@ import json
 import os
 import re
 import time as time_mod
-from datetime import date
+from datetime import date, timedelta
+from urllib.parse import urlsplit
+
+import requests
 
 from ..models import ScrapeResult, Slot, normalize_time, parse_price
 from .base import BaseScraper
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 
 TIME_RE = re.compile(r"^\s*([01]?\d|2[0-3])\s*[h:]\s*([0-5]\d)\s*$")
 ISO_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
@@ -180,11 +190,125 @@ class SecuritestScraper(BaseScraper):
         self.steps: list[list[str]] = [list(s) for s in center.get("steps", [])]
         self.next_texts: list[str] = list(center.get("next_button_texts",
                                                      ["Suivant", "Continuer", "Valider"]))
+        self.code_centre: str = str(center.get("code_centre", ""))
+        api = center.get("api", {})
+        self.type_rdv = str(api.get("type_rdv", 1))    # 1 = CTP
+        self.type_veh = str(api.get("type_veh", 1))    # 1 = Véhicule particulier
+        self.carb_veh = str(api.get("carb_veh", 1))    # 1 = Essence
+        self.browser_fallback: bool = bool(center.get("browser_fallback", True))
         self.headless = headless
         self.debug_dir = debug_dir or os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
             "debug", "securitest",
         )
+
+    # ------------------------------------------------------------- mode API
+
+    @property
+    def _api_base(self) -> str:
+        parts = urlsplit(self.url)
+        return f"{parts.scheme}://{parts.netloc}"
+
+    def _make_api_session(self) -> requests.Session:
+        session = requests.Session()
+        session.headers.update({"User-Agent": USER_AGENT})
+        # Le GET de la page associe le code centre (?c=...) à la session PHP :
+        # sans ce passage, l'API répond « Aucun centre ne correspond ».
+        session.get(self.url, timeout=30)
+        session.headers.update({
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": self.url,
+            "Accept": "application/json, text/plain, */*",
+        })
+        return session
+
+    def _api_params(self, **extra) -> dict:
+        params = {
+            "typeRdv": self.type_rdv,
+            "typeVeh": self.type_veh,
+            "carbVeh": self.carb_veh,
+            "codePromo": "",
+            "codeCentre": self.code_centre,
+        }
+        params.update(extra)
+        return params
+
+    def _scrape_api(self, result: ScrapeResult) -> None:
+        session = self._make_api_session()
+        today = date.today()
+        horizon = today + timedelta(weeks=self.weeks_ahead)
+
+        # Jours ouverts : le calendrier se demande par fenêtres de 27 jours
+        # (même découpage que l'application officielle).
+        open_days: list[dict] = []
+        window_start = today - timedelta(days=today.weekday())  # lundi courant
+        while window_start <= horizon:
+            resp = session.get(
+                f"{self._api_base}/rdv/api/calendar",
+                params=self._api_params(
+                    dateFrom=window_start.isoformat(),
+                    dateTo=(window_start + timedelta(days=26)).isoformat(),
+                ),
+                timeout=30,
+            )
+            resp.raise_for_status()
+            weeks = resp.json()
+            if not isinstance(weeks, list):
+                raise ValueError(f"réponse calendar inattendue : {str(weeks)[:200]}")
+            for week in weeks:
+                for day in week.get("days", []):
+                    if day.get("disabled") or not day.get("display_web", True):
+                        continue
+                    day_date = day.get("date", "")
+                    if not day_date or day_date < today.isoformat() \
+                            or day_date > horizon.isoformat():
+                        continue
+                    open_days.append(day)
+            window_start += timedelta(days=27)
+            time_mod.sleep(self.request_delay)
+
+        # Horaires de chaque jour ouvert
+        seen: set[str] = set()
+        for day in open_days:
+            day_date = day["date"]
+            if day_date in seen:
+                continue
+            seen.add(day_date)
+            resp = session.get(
+                f"{self._api_base}/rdv/api/creneau",
+                params=self._api_params(date=day_date),
+                timeout=30,
+            )
+            resp.raise_for_status()
+            for item in resp.json() or []:
+                slot = self._slot_from_api(day_date, item)
+                if slot:
+                    result.slots.append(slot)
+            time_mod.sleep(self.request_delay)
+
+        result.slots.sort(key=lambda s: (s.date, s.time))
+
+    def _slot_from_api(self, day_date: str, item: dict) -> Slot | None:
+        """Convertit une entrée de /rdv/api/creneau en Slot."""
+        hour = str(item.get("hour") or item.get("heure_from") or "").strip()
+        if not hour:
+            return None
+        price = item.get("final_price", item.get("price"))
+        price = float(price) if price is not None else None
+        base_price = None
+        promo = item.get("promo")
+        if isinstance(promo, dict) and promo.get("start_price") is not None:
+            base_price = float(promo["start_price"])
+        extra = {"source": "api"}
+        if item.get("controleur_id"):
+            extra["controleur_id"] = str(item["controleur_id"])
+        if item.get("heure_to"):
+            extra["heure_to"] = normalize_time(str(item["heure_to"])[:5])
+        if isinstance(promo, dict) and promo.get("promo_type"):
+            extra["promo_type"] = promo["promo_type"]
+        return self._make_slot(day_date, normalize_time(hour[:5]), price, extra=extra,
+                               base_price=base_price,
+                               agenda_id=str(item.get("controleur_id", "")))
 
     # ------------------------------------------------------------ navigation
 
@@ -229,9 +353,27 @@ class SecuritestScraper(BaseScraper):
     # ---------------------------------------------------------------- scrape
 
     def scrape(self) -> ScrapeResult:
+        result = ScrapeResult(center_id=self.center_id, slots=[])
+
+        try:
+            self._scrape_api(result)
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            result.errors.append(f"Mode API en échec ({exc}), "
+                                 "bascule sur le mode navigateur.")
+
+        if not result.slots and self.browser_fallback:
+            self._scrape_browser(result)
+
+        prices = [s.price for s in result.slots if s.price is not None]
+        result.min_price = min(prices) if prices else None
+        result.max_price = max(prices) if prices else None
+        return result
+
+    # ------------------------------------------------------ mode navigateur
+
+    def _scrape_browser(self, result: ScrapeResult) -> None:
         from playwright.sync_api import sync_playwright
 
-        result = ScrapeResult(center_id=self.center_id, slots=[])
         captured: list[dict] = []
 
         launch_kwargs: dict = {"headless": self.headless}
@@ -239,6 +381,12 @@ class SecuritestScraper(BaseScraper):
         # au lieu de celui téléchargé par `playwright install chromium`.
         if os.environ.get("CTSPY_CHROMIUM"):
             launch_kwargs["executable_path"] = os.environ["CTSPY_CHROMIUM"]
+        # Chromium ignore les variables d'environnement proxy : on les relaie
+        # explicitement (réseaux d'entreprise, sandboxes...).
+        proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
+            or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+        if proxy_url:
+            launch_kwargs["proxy"] = {"server": proxy_url}
 
         with sync_playwright() as p:
             browser = p.chromium.launch(**launch_kwargs)
@@ -284,7 +432,7 @@ class SecuritestScraper(BaseScraper):
 
                 if slots:
                     for slot in slots:
-                        slot.extra["source"] = source
+                        slot.extra["source"] = "browser-" + source
                     result.slots = sorted(slots, key=lambda s: (s.date, s.time))
                 else:
                     prefix = self._save_debug(page, captured, "aucun créneau détecté")
@@ -299,20 +447,18 @@ class SecuritestScraper(BaseScraper):
             finally:
                 browser.close()
 
-        prices = [s.price for s in result.slots if s.price is not None]
-        result.min_price = min(prices) if prices else None
-        result.max_price = max(prices) if prices else None
-        return result
-
     # ----------------------------------------------------------- extraction
 
     def _make_slot(self, day: str, hour: str, price: float | None,
-                   extra: dict | None = None) -> Slot:
+                   extra: dict | None = None, base_price: float | None = None,
+                   agenda_id: str = "") -> Slot:
         return Slot(
             center_id=self.center_id,
             date=day,
             time=hour,
             price=price,
+            base_price=base_price,
+            agenda_id=agenda_id,
             control_type=self.labels.get("control", ""),
             vehicle_type=self.labels.get("vehicle", ""),
             energy=self.labels.get("energy", ""),

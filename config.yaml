@@ -40,6 +40,14 @@ centers:
     scraper: securitest
     url: "https://agenda2.securitest.org/rdv/?origine=affilie&c=S011027#!/"
     code_centre: "S01102702"
+    # Mode API (par défaut) : identifiants du profil demandé, lisibles via
+    # /rdv/api/types et /rdv/api/config (voir README).
+    api:
+      type_rdv: 1     # 1 = CTP — Contrôle technique périodique
+      type_veh: 1     # 1 = VP — Véhicule particulier (2=VU, 7=Moto...)
+      carb_veh: 1     # 1 = Essence (2=Diesel, 3=Gaz, 4=Hybride, 5=Electrique)
+    # Repli navigateur (Playwright) si l'API échoue :
+    browser_fallback: true
     # Textes cliqués dans le parcours Angular avant d'atteindre le planning.
     # Chaque étape essaie les libellés dans l'ordre jusqu'à en trouver un.
     steps:

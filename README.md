@@ -10,7 +10,7 @@ Deux familles de sites sont prises en charge :
 | Scraper      | Plateforme                              | Exemple                     | Technique |
 |--------------|------------------------------------------|-----------------------------|-----------|
 | `rdvonline`  | RDV-Online / Karoil (control-v11.fr, …)  | CONTROL'V Villemoustaussou  | Appels HTTP directs à l'endpoint AJAX `Horaires.php` (rapide, sans navigateur) |
-| `securitest` | Genilink (agenda2.securitest.org)        | AAB Carcassonne             | Navigateur headless Playwright (parcours Angular multi-étapes) |
+| `securitest` | Genilink (agenda2.securitest.org)        | AAB Carcassonne             | Appels directs à l'API JSON `/rdv/api/*` (repli Playwright si l'API évolue) |
 
 ## Installation
 
@@ -89,22 +89,33 @@ directement à cette date.
 ### Ajouter un centre Securitest / Genilink (`scraper: securitest`)
 
 - `url` : l'URL complète de l'agenda (avec `?origine=…&c=…`) ;
-- `steps` : les libellés à cliquer pour franchir les étapes avant le planning
-  (type de véhicule, énergie, type de contrôle). Chaque étape est une liste de
-  variantes de texte, essayées dans l'ordre ;
-- `next_button_texts` : libellés des boutons de validation d'étape.
+- `code_centre` : le code interne du centre, visible dans le HTML de la page
+  (`.constant('codeCentre', 'S01102702')`) ;
+- `api.type_rdv`, `api.type_veh`, `api.carb_veh` : identifiants du profil.
 
-Le scraper récupère les créneaux de deux façons : en **interceptant les
-réponses JSON de l'API** pendant la navigation (fiable), puis en dernier
-recours par lecture heuristique du DOM. Si aucun créneau n'est détecté, des
-**artefacts de debug** (capture d'écran, HTML de la page, JSON interceptés)
-sont écrits dans `debug/securitest/` : ouvrez-les pour ajuster `steps` ou nous
-transmettre la structure réelle des écrans. Le mode `--headful` permet aussi
-d'observer le parcours en direct.
+**Mode API (par défaut, validé en conditions réelles)** : le scraper charge la
+page une fois (le serveur associe le centre à la session PHP), puis interroge
+directement l'API JSON du site :
 
-> ⚠️ Ce scraper est « best-effort » : il a été écrit sans accès réseau aux
-> sites (bloqué dans l'environnement de développement). Le premier lancement
-> réel produira au besoin les artefacts de debug pour finaliser les sélecteurs.
+- `GET /rdv/api/config` → configuration du centre et liste `rdv_types`
+  (1 = CTP contrôle technique périodique) ;
+- `GET /rdv/api/types?typeId=1` → véhicules (1=VP, 2=VU, 7=Moto…) et
+  carburants (1=Essence, 2=Diesel, 3=Gaz, 4=Hybride, 5=Electrique) ;
+- `GET /rdv/api/calendar?dateFrom=…&dateTo=…&…&codeCentre=…` → jours ouverts
+  et tarif du jour, par fenêtres de 27 jours ;
+- `GET /rdv/api/creneau?date=…&…` → horaires du jour avec `price`,
+  `final_price` et promotion éventuelle (ex. remise paiement en ligne `pel`).
+
+Pour découvrir les identifiants d'un profil différent, appelez ces deux
+premiers endpoints dans un navigateur après avoir ouvert la page de l'agenda.
+
+**Mode navigateur (repli)** : si l'API échoue (évolution du site), le scraper
+bascule sur Playwright et rejoue le parcours humain — `steps` liste les
+libellés à cliquer à chaque étape, `next_button_texts` les boutons de
+validation. Les échecs produisent des **artefacts de debug** (capture d'écran,
+HTML, JSON interceptés) dans `debug/securitest/`, et `--headful` permet
+d'observer le parcours en direct. Ce repli se désactive avec
+`browser_fallback: false`.
 
 ## Planification (relevés réguliers)
 

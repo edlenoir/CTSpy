@@ -52,3 +52,43 @@ def test_find_slots_in_json_nested_and_combined_datetime():
 def test_find_slots_in_json_ignores_non_slots():
     payload = {"config": {"version": "3.9"}, "centre": {"nom": "AAB", "cp": "11000"}}
     assert find_slots_in_json(payload) == []
+
+
+def make_api_scraper():
+    from ctspy.scrapers.securitest import SecuritestScraper
+    center = {
+        "id": "test-sec", "url": "https://agenda2.example.invalid/rdv/?c=X",
+        "code_centre": "S000", "api": {"type_rdv": 1, "type_veh": 1, "carb_veh": 1},
+        "labels": {"vehicle": "Véhicule particulier", "energy": "Essence", "control": "CTP"},
+    }
+    return SecuritestScraper(center, weeks_ahead=1, request_delay=0)
+
+
+def test_slot_from_api_with_promo():
+    scraper = make_api_scraper()
+    item = {"controleur_id": "7465", "heure_from": "08:00:00", "heure_to": "08:30:00",
+            "price": 85, "final_price": 80, "hour": "08:00:00",
+            "promo": {"value": 5, "type": "€", "promo_type": "pel", "start_price": 85}}
+    slot = scraper._slot_from_api("2026-07-21", item)
+    assert slot.date == "2026-07-21"
+    assert slot.time == "08:00"
+    assert slot.price == 80.0
+    assert slot.base_price == 85.0
+    assert slot.is_promo
+    assert slot.agenda_id == "7465"
+    assert slot.extra["promo_type"] == "pel"
+    assert slot.extra["heure_to"] == "08:30"
+
+
+def test_slot_from_api_without_promo():
+    scraper = make_api_scraper()
+    slot = scraper._slot_from_api("2026-07-21", {"hour": "14:45:00", "price": 85})
+    assert slot.time == "14:45"
+    assert slot.price == 85.0
+    assert slot.base_price is None
+    assert not slot.is_promo
+
+
+def test_slot_from_api_invalid():
+    scraper = make_api_scraper()
+    assert scraper._slot_from_api("2026-07-21", {"price": 85}) is None
